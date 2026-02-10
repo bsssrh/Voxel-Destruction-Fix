@@ -218,13 +218,6 @@ namespace VoxelDestructionPro.VoxelObjects
             
             DisposeAll();
 
-            // IMPORTANT:
-            // This object can be reused (e.g. from pooling). Ensure pivot is recalculated for the
-            // newly assigned voxel data instead of keeping stale targetFilter local offset.
-            pivotInit = false;
-            if (targetFilter != null)
-                targetFilter.transform.localPosition = Vector3.zero;
-
             if (data == null)
             {
                 Debug.LogError("AssignVoxelData without valid voxeldata called!", this);
