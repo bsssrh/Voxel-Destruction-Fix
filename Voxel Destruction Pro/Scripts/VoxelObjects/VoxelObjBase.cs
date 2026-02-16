@@ -16,162 +16,123 @@ using Random = UnityEngine.Random;
 namespace VoxelDestructionPro.VoxelObjects
 {
     /// <summary>
-    /// OPTIMIZED: Transform caching + smart pivot + fixed fragment spawn
+    /// This is the base class for all voxel objects
+    ///
+    /// It handles most important operation, like mesh generation, pivot setting,
+    /// collider baking, ...
+    ///
+    /// You can override it to create custom voxel objects
     /// </summary>
     public class VoxelObjBase : MonoBehaviour
     {
         #region Enums
-        public enum ScaleType { Voxel, Units }
+
+        public enum ScaleType
+        {
+            Voxel, Units
+        }
+
         #endregion
         
-        #region Parameters
+        #region Parameter
+
         [Header("Pivot")] 
+        
+        [Tooltip("If enabled the mesh filter object will be moved to match the pivotPlacement vector")]
         public bool setPivot = true;
+        [Tooltip("Defines where the pivot should be placed, (0,0,0) = bottom left, (0.5,0.5,0.5) = center")]
         public Vector3 pivotPlacement = new Vector3(0.5f, 0.5f, 0.5f);
-        [SerializeField] [HideInInspector] private bool pivotInit;
+        [SerializeField] [HideInInspector]
+        private bool pivotInit;
 
         [Header("Mesh")] 
+        
+        [Tooltip("Defines how the objectScale should be used.\nVoxel: The objectscale describes the size of a single voxel in units" +
+                 "\nUnits: The objectscale describes the size of a single voxel relative to the length of the voxeldata. Useful for uniform scaling independent of voxel count")]
         public ScaleType scaleType = ScaleType.Voxel;
+        [Tooltip("The size of the voxel object, size behaviour is defined by the scaletype")]
         public float objectScale = 1;
         public MeshFilter targetFilter;
+        [Tooltip("Assign either a MeshCollider or a BoxCollider to this")]
         public Collider targetCollider;
+        [Tooltip("The mesh setting object holds information on how the mesh should be constructed, collider settings and more")]
         public MeshSettingsObj meshSettings;
 
         [Header("Other")]
+        
+        [Tooltip("If set to true you can access the public int fields 'startVoxelCount' and 'currentVoxelCount' " +
+                 "to calculate how much of the object got destroyed")]
         public bool calculateVoxelCount;
 
         [Header("Cleanup")]
-        [Min(0)] public int destructionDelayFrames = 1;
-        [Min(1)] public int maxDeferredDestructionsPerFrame = 4;
-        [Min(1)] public int maxMeshRegenerationsPerFrame = 2;
+        [Min(0)]
+        public int destructionDelayFrames = 1;
+        [Min(1)]
+        public int maxDeferredDestructionsPerFrame = 4;
+        [Min(1)]
+        public int maxMeshRegenerationsPerFrame = 2;
 
-        [HideInInspector] public int startVoxelCount;
-        [HideInInspector] public int currentVoxelCount;
+        [HideInInspector]
+        public int startVoxelCount;
+        [HideInInspector]
+        public int currentVoxelCount;
         
-        // ✅ OPTIMIZATION: Cached transforms
-        private Transform _cachedTransform;
-        private Transform _cachedFilterTransform;
-        private Matrix4x4 _cachedWorldToLocalMatrix;
-        private Matrix4x4 _cachedLocalToWorldMatrix;
-        private bool _transformCacheValid;
-        private int _lastCacheFrame = -1;
-        
+        //Private
         public VoxelData voxelData;
         protected IVoxMesher mesher;
         protected ColliderBaker colliderBaker;
         protected CompoundBoxColliderManager compoundColliderManager;
         private Mesh cMesh;
-        [SerializeField] [HideInInspector] protected bool isCreated;
+        [SerializeField] [HideInInspector]
+        protected bool isCreated;
 
         private bool destructionQueued;
         private bool meshRegenerationQueued;
         
+        //Active
         protected bool meshRegenerationActive;
         protected bool colliderBakeActive;
+        //Requested
         protected bool meshRegenerationRequested;
         protected bool colliderBakeRequested;
         public bool objectDestructionRequested;
         
         protected bool isValidObject;
         
+        //Events
         public Action<Mesh> onMeshGenerated;
         public Action<VoxelData> onVoxeldataChanged;
         public Action onVoxelDestroy;
         
+        //Properties
+        /// <summary>
+        /// The voxeldatas active voxel count, note this expensive to calculate for larger voxel objects
+        /// </summary>
         public int ActiveVoxelCount => voxelData.GetActiveVoxelCount();
         public int3 VoxelDataLength => voxelData.length;
         public int VoxelDataVolume => voxelData.Volume;
-        public VoxelData CurrentVoxelData => voxelData;
+        
+        /// <summary>
+        /// The current voxeldata, can be null
+        /// </summary>
+        public VoxelData CurrentVoxelData
+        {
+            get => voxelData;
+        }
 
-        private static readonly System.Collections.Generic.List<DestructionRequest> DestructionQueue = 
-            new System.Collections.Generic.List<DestructionRequest>();
+        private static readonly System.Collections.Generic.List<DestructionRequest> DestructionQueue = new System.Collections.Generic.List<DestructionRequest>();
         private static int lastDestructionProcessFrame = -1;
         private static int globalMaxDeferredDestructionsPerFrame = 4;
-        
-        private static readonly System.Collections.Generic.List<VoxelObjBase> MeshRegenerationQueue = 
-            new System.Collections.Generic.List<VoxelObjBase>();
+        private static readonly System.Collections.Generic.List<VoxelObjBase> MeshRegenerationQueue = new System.Collections.Generic.List<VoxelObjBase>();
         private static int lastMeshProcessFrame = -1;
         private static int globalMaxMeshRegenerationsPerFrame = 2;
-        #endregion
-
-        #region Transform Caching (OPTIMIZATION)
         
-        /// <summary>
-        /// ✅ OPTIMIZATION: Get cached transform (no allocation)
-        /// </summary>
-        protected Transform CachedTransform
-        {
-            get
-            {
-                if (_cachedTransform == null)
-                    _cachedTransform = transform;
-                return _cachedTransform;
-            }
-        }
-
-        /// <summary>
-        /// ✅ OPTIMIZATION: Get cached filter transform
-        /// </summary>
-        protected Transform CachedFilterTransform
-        {
-            get
-            {
-                if (_cachedFilterTransform == null && targetFilter != null)
-                    _cachedFilterTransform = targetFilter.transform;
-                return _cachedFilterTransform;
-            }
-        }
-
-        /// <summary>
-        /// ✅ OPTIMIZATION: Get cached world-to-local matrix (updated once per frame)
-        /// </summary>
-        protected Matrix4x4 GetCachedWorldToLocalMatrix()
-        {
-            if (!_transformCacheValid || Time.frameCount != _lastCacheFrame)
-                UpdateTransformCache();
-            return _cachedWorldToLocalMatrix;
-        }
-
-        /// <summary>
-        /// ✅ OPTIMIZATION: Get cached local-to-world matrix
-        /// </summary>
-        protected Matrix4x4 GetCachedLocalToWorldMatrix()
-        {
-            if (!_transformCacheValid || Time.frameCount != _lastCacheFrame)
-                UpdateTransformCache();
-            return _cachedLocalToWorldMatrix;
-        }
-
-        /// <summary>
-        /// ✅ Updates transform cache (called max once per frame)
-        /// </summary>
-        private void UpdateTransformCache()
-        {
-            Transform meshTransform = CachedFilterTransform ?? CachedTransform;
-            _cachedLocalToWorldMatrix = meshTransform.localToWorldMatrix;
-            _cachedWorldToLocalMatrix = meshTransform.worldToLocalMatrix;
-            _transformCacheValid = true;
-            _lastCacheFrame = Time.frameCount;
-        }
-
-        /// <summary>
-        /// ✅ Invalidate cache when transform changes
-        /// </summary>
-        protected void InvalidateTransformCache()
-        {
-            _transformCacheValid = false;
-        }
-
         #endregion
 
         #region Creation
 
         protected virtual void Awake()
         {
-            _cachedTransform = transform;
-            if (targetFilter != null)
-                _cachedFilterTransform = targetFilter.transform;
-                
             compoundColliderManager = GetComponent<CompoundBoxColliderManager>();
             globalMaxDeferredDestructionsPerFrame = Mathf.Max(globalMaxDeferredDestructionsPerFrame, maxDeferredDestructionsPerFrame);
             globalMaxMeshRegenerationsPerFrame = Mathf.Max(globalMaxMeshRegenerationsPerFrame, maxMeshRegenerationsPerFrame);
@@ -189,6 +150,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 mc.sharedMesh == null)
             {
                 Rigidbody rb = GetComponent<Rigidbody>();
+
                 if (rb != null)
                     rb.isKinematic = true;
             }
@@ -196,6 +158,7 @@ namespace VoxelDestructionPro.VoxelObjects
 
         protected virtual void CreateJobs()
         {
+            //Create the mesher
             if (meshSettings.mesherType == MeshSettingsObj.MeshCalculationType.Simple)
                 mesher ??= new GreedyMesher(GetSingleVoxelSize(), voxelData);
             else
@@ -215,6 +178,8 @@ namespace VoxelDestructionPro.VoxelObjects
                 isValidObject = false;
                 return;
             }
+            
+            pivotInit = false;
 
             if (voxelData == null)
             {
@@ -234,31 +199,31 @@ namespace VoxelDestructionPro.VoxelObjects
         }
         
         /// <summary>
-        /// ✅ FIXED: Smart pivot handling - don't reset if already initialized
+        /// Assigns the voxeldata and creates the object if not created yet
+        /// Editormode should only be true if this function is ran outside of
+        /// play mode
         /// </summary>
+        /// <param name="data"></param>
+        /// <param name="editorMode"></param>
         public virtual void AssignVoxelData(VoxelData data, bool editorMode = false)
         {
             if (meshRegenerationActive)
-                return;
+                return; //We cant assign it while it is using it
+            
+            /*
+             * We dispose all jobs and create them again because the old voxeldata
+             * needs to get Disposed. If a jobs us currently using it it will throw an error,
+             * thus we need to also dispose that on first
+            */
             
             DisposeAll();
 
-            // ✅ FIX: Only reset pivot if this is truly a NEW object or data is different scale
-            bool isNewObject = !pivotInit || voxelData == null;
-            bool isScaleChange = voxelData != null && !Mathf.Approximately(
-                GetSingleVoxelSizeForData(voxelData), 
-                GetSingleVoxelSizeForData(data)
-            );
-
-            if (isNewObject || isScaleChange)
-            {
-                pivotInit = false;
-                if (targetFilter != null)
-                {
-                    _cachedFilterTransform = targetFilter.transform;
-                    _cachedFilterTransform.localPosition = Vector3.zero;
-                }
-            }
+            // IMPORTANT:
+            // This object can be reused (e.g. from pooling). Ensure pivot is recalculated for the
+            // newly assigned voxel data instead of keeping stale targetFilter local offset.
+            pivotInit = false;
+            if (targetFilter != null)
+                targetFilter.transform.localPosition = Vector3.zero;
 
             if (data == null)
             {
@@ -273,9 +238,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 startVoxelCount = data.GetActiveVoxelCount();
                 currentVoxelCount = startVoxelCount;
             }
-            
             isValidObject = true;
-            InvalidateTransformCache();
             RequestMeshRegeneration();
             
             if (!isCreated)
@@ -283,26 +246,18 @@ namespace VoxelDestructionPro.VoxelObjects
             else if (!editorMode)
                 CreateJobs();
             
-            onVoxeldataChanged?.Invoke(voxelData);
+            if (onVoxeldataChanged != null) 
+                onVoxeldataChanged.Invoke(voxelData);
+
             NotifyVoxelDataAssigned(voxelData);
             RequestCompoundColliderRebuild();
         }
-
-        /// <summary>
-        /// ✅ Helper: Get voxel size for specific data (doesn't modify state)
-        /// </summary>
-        private float GetSingleVoxelSizeForData(VoxelData data)
-        {
-            if (data == null) return objectScale;
-            
-            return scaleType switch
-            {
-                ScaleType.Voxel => objectScale,
-                ScaleType.Units => objectScale / math.length(data.length),
-                _ => objectScale
-            };
-        }
         
+        /// Do not call directly, use meshRegenerationRequested instead!
+        /// <summary>
+        /// </summary>
+        /// <param name="editorMode"></param>
+        /// <returns></returns>
         protected virtual IEnumerator GenerateMesh(bool editorMode = false)
         {
             meshRegenerationActive = true;
@@ -316,9 +271,11 @@ namespace VoxelDestructionPro.VoxelObjects
             }
             
             Profiler.BeginSample("Starting Mesher");
+            //Let it schedule the greedy job
             mesher.Prepare(voxelData);
             Profiler.EndSample();
 
+            //Let him cook
             while (true)
             {
                 if (mesher == null)
@@ -334,9 +291,11 @@ namespace VoxelDestructionPro.VoxelObjects
 
             if (meshSettings.meshConstructionJob && !editorMode)
             {
+                //For complex meshes every operation will take some time
+                //we want to minimize the lag by adding some delay
                 mesher.StartBuildMesh();
                 
-                while (!mesher.IsMeshJobFinished())
+                while (!mesher.IsMeshJobFinished()) //This should only take few frames
                     yield return null;
                 
                 m = mesher.CompleteMeshBuilding();
@@ -352,42 +311,51 @@ namespace VoxelDestructionPro.VoxelObjects
         }
 
         /// <summary>
-        /// ✅ FIXED: Better pivot handling
+        /// Sets the MeshFilter and MeshCollider Mesh and calculates
+        /// Pivot
         /// </summary>
+        /// <param name="m"></param>
+        /// <param name="editorMode"></param>
         protected void SetMesh(Mesh m, bool editorMode)
         {
+            //Destroy the mesh to remove it from memory, 10 seconds delay because the collision could still be
+            //baking in background
             if (cMesh != m && !editorMode)
                 StartCoroutine(ReleaseMeshAfterDelay(cMesh, 10f));
             
             cMesh = m;
-            onMeshGenerated?.Invoke(m);
+            if (onMeshGenerated != null)
+                onMeshGenerated.Invoke(m);
             NotifyMeshGenerated(m);
             
             if (m == null || m.vertexCount == 0)
             {
                 if (!editorMode)
                     objectDestructionRequested = true;
+
                 m = null;
             }
             
+            //Assign Mesh
             targetFilter.mesh = m;
             
-            // ✅ FIXED: Only calculate pivot ONCE for this voxel data
-            if (!pivotInit && setPivot && m != null)
+            //Pivot Stuff: pivotInit marks if the pivot is already set to avoid reseting it
+            //every time a destruction occurs
+            if (!pivotInit)
             {
                 pivotInit = true;
                 
-                Vector3 length = m.bounds.max - m.bounds.min;
-                length.x *= pivotPlacement.x;
-                length.y *= pivotPlacement.y;
-                length.z *= pivotPlacement.z;
-                
-                Vector3 localTargetPoint = length + m.bounds.min;
-                
-                if (_cachedFilterTransform != null)
+                if (setPivot && m != null)
                 {
-                    _cachedFilterTransform.localPosition = -localTargetPoint;
-                    InvalidateTransformCache();
+                    Vector3 length = m.bounds.max - m.bounds.min;
+                    length.x *= pivotPlacement.x;
+                    length.y *= pivotPlacement.y;
+                    length.z *= pivotPlacement.z;
+                    
+                    //Get the target localPosition from Mesh.bounds
+                    Vector3 localTargetPoint = length + m.bounds.min;
+                    
+                    targetFilter.transform.localPosition = -localTargetPoint;
                 }
             }
             
@@ -403,11 +371,13 @@ namespace VoxelDestructionPro.VoxelObjects
                 {
                     if (targetCollider is MeshCollider meshCollider)
                     {
+                        //No cookingOptions = Better performance, without a job we use none
                         if (!meshSettings.useThreadedCollisionBaking)
                             meshCollider.cookingOptions = MeshColliderCookingOptions.None;
                         else
                             meshCollider.cookingOptions = meshSettings.cookingOptions;
 
+                        //ThreadedColliderBaking is only used in playmode
                         if (editorMode || !meshSettings.useThreadedCollisionBaking)
                             meshCollider.sharedMesh = m;
                         else
@@ -428,6 +398,9 @@ namespace VoxelDestructionPro.VoxelObjects
             Profiler.EndSample();
         }
 
+        /// <summary>
+        /// Clears the Mesh, Collider, voxelData and created
+        /// </summary>
         public virtual void Clear()
         {
             objectDestructionRequested = false;
@@ -449,6 +422,11 @@ namespace VoxelDestructionPro.VoxelObjects
             DisposeAll();
         }
         
+        /// <summary>
+        /// Gets called from the editor quick setup button,
+        /// creates some stuff based on the settings defined
+        /// on the VoxelManager
+        /// </summary>
         public virtual void QuickSetup(VoxelManager manager)
         {
             if (manager == null)
@@ -463,13 +441,14 @@ namespace VoxelDestructionPro.VoxelObjects
             }
             
             GameObject nFilter = new GameObject();
-            nFilter.transform.parent = CachedTransform;
+            
+            nFilter.transform.parent = transform;
             nFilter.gameObject.name = "Voxel Mesh";
             nFilter.transform.localPosition = Vector3.zero;
             
             targetFilter = nFilter.AddComponent<MeshFilter>();
-            _cachedFilterTransform = targetFilter.transform;
             
+            //Collider setup
             if (manager.standardCollider != VoxelManager.ColliderType.None)
             {
                 MeshCollider mc = nFilter.AddComponent<MeshCollider>();
@@ -483,6 +462,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 targetCollider = null;
             
             MeshRenderer mr = nFilter.AddComponent<MeshRenderer>();
+
             mr.material = manager.standardMaterial;
             mr.shadowCastingMode = ShadowCastingMode.TwoSided;
             meshSettings = manager.standardMeshSettings;
@@ -492,9 +472,14 @@ namespace VoxelDestructionPro.VoxelObjects
 
         #region Events
         
+        /// <summary>
+        /// Destroys the mesh object
+        /// </summary>
         protected virtual void DestroyVoxObj()
         {
-            onVoxelDestroy?.Invoke();
+            if (onVoxelDestroy != null)
+                onVoxelDestroy.Invoke();
+            
             Clear();
             
             if (meshSettings.emptyAction == MeshSettingsObj.EmptyAction.Destroy)
@@ -503,6 +488,12 @@ namespace VoxelDestructionPro.VoxelObjects
                 gameObject.SetActive(false);
         }
 
+        /// <summary>
+        /// Allows you to block the destruction of the object,
+        /// some jobs need to complete before the voxelobject can be
+        /// destroyed
+        /// </summary>
+        /// <returns></returns>
         protected virtual bool CanDestroyObject()
         {
             return true;
@@ -520,12 +511,18 @@ namespace VoxelDestructionPro.VoxelObjects
             DisposeAll();
         }
 
+        /// <summary>
+        /// You can call this multiple times, but once called
+        /// all jobs get disposed and you cant use them anymore
+        /// </summary>
         protected virtual void DisposeAll()
         {
-            mesher?.Dispose();
+            if (mesher != null)
+                mesher.Dispose();
             mesher = null;
             
-            voxelData?.Dispose();
+            if (voxelData != null)
+                voxelData.Dispose();
             voxelData = null;
         }
         
@@ -559,6 +556,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 if (meshSettings.freezeRbWhileBaking)
                 {
                     Rigidbody rb = GetComponent<Rigidbody>();
+
                     if (rb != null)
                         rb.isKinematic = false;
                 }
@@ -566,8 +564,6 @@ namespace VoxelDestructionPro.VoxelObjects
         }
 
         #endregion
-
-        #region Destruction Queue
 
         private void QueueDestruction()
         {
@@ -641,10 +637,13 @@ namespace VoxelDestructionPro.VoxelObjects
             public int ReadyFrame { get; }
         }
         
-        #endregion
-        
         #region Other
         
+        /// <summary>
+        /// This method checks if the settings are valid,
+        /// will abort the mesh creation in case there are invalid settings
+        /// </summary>
+        /// <returns></returns>
         protected virtual bool AssertVoxelObject()
         {
             if (GetSingleVoxelSize() == 0)
@@ -671,6 +670,7 @@ namespace VoxelDestructionPro.VoxelObjects
             return true;
         }
 
+        //Index Stuff
         protected Vector3 To3D(int index, int xMax, int yMax)
         {
             int z = index / (xMax * yMax);
@@ -843,7 +843,9 @@ namespace VoxelDestructionPro.VoxelObjects
         #endregion
 
         #region Debug
+
         #if UNITY_EDITOR
+        
         [ContextMenu("Show debug info")]
         public void ShowDebugInfo()
         {
@@ -854,7 +856,9 @@ namespace VoxelDestructionPro.VoxelObjects
             Debug.Log("Active voxel count: " + ActiveVoxelCount);
             Debug.Log("Voxel data volume: " + VoxelDataVolume);
         }
+
         #endif
+        
         #endregion
     }      
 }
