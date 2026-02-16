@@ -14,6 +14,8 @@ namespace VoxelDestructionPro.VoxelObjects
 {
      /// <summary>
      /// Finds isolated pieces in the voxelobject and removes them
+     /// 
+     /// ✅ FIX: Сохраняет матрицу трансформации для корректного позиционирования изолированных фрагментов
      /// </summary>
     public class IsolatedVoxelObj : VoxelObjBase
     {
@@ -45,6 +47,10 @@ namespace VoxelDestructionPro.VoxelObjects
         /// </summary>
         protected bool lockIsolatorRebuild;
         private bool pendingIsolationRebuild;
+
+        // ✅ FIX: Сохранённая матрица трансформации для корректного позиционирования изолированных фрагментов
+        private Matrix4x4 savedIsolationTransformMatrix;
+        private bool hasSavedIsolationMatrix;
         
         private CCL_Isolator isolator;
         private IsolationProcessor isolationProcessor;
@@ -98,6 +104,11 @@ namespace VoxelDestructionPro.VoxelObjects
                 
                 isolatorRequested = false;
                 isolatorActive = true;
+
+                // ✅ FIX: Сохраняем матрицу трансформации перед началом изоляции
+                Transform meshTransform = targetFilter != null ? targetFilter.transform : transform;
+                savedIsolationTransformMatrix = meshTransform.localToWorldMatrix;
+                hasSavedIsolationMatrix = true;
                 
                 isolator.Begin(voxelData);
             }
@@ -161,14 +172,22 @@ namespace VoxelDestructionPro.VoxelObjects
             VoxelData[] fragments = isolationProcessor.CreateFragments(voxelData, out Vector3[] positions);
 
             if (fragments == null)
+            {
+                hasSavedIsolationMatrix = false;
                 return;
+            }
 
             if (targetFilter == null)
             {
                 for (int i = 0; i < fragments.Length; i++)
                     fragments[i]?.Dispose();
+                hasSavedIsolationMatrix = false;
                 return;
             }
+
+            // ✅ OPTIMIZATION: Cache voxel size and rotation - used repeatedly in loops
+            float voxelSize = GetSingleVoxelSize();
+            Quaternion worldRot = GetRotationFromSavedIsolationMatrix();
             
             VoxelFragmentGroup fragmentGroup = null;
             Dictionary<int, List<VoxelFragmentGroup.AttachmentData>> attachmentMap = null;
@@ -183,7 +202,8 @@ namespace VoxelDestructionPro.VoxelObjects
                 fragmentWorldPositions = new Vector3[positions.Length];
                 for (int p = 0; p < positions.Length; p++)
                 {
-                    fragmentWorldPositions[p] = targetFilter.transform.TransformPoint(positions[p] * GetSingleVoxelSize());
+                    // ✅ FIX: Use saved matrix for consistent positioning
+                    fragmentWorldPositions[p] = TransformPointUsingSavedIsolationMatrix(positions[p] * voxelSize);
                 }
 
                 attachmentMap = fragmentGroup.BuildAttachmentMap(transform, fragmentWorldPositions);
@@ -199,8 +219,22 @@ namespace VoxelDestructionPro.VoxelObjects
                         fragments[i].Dispose();
                         continue; 
                     }
+
+                // ✅ FIX: Validate position to prevent coordinate errors
+                if (!IsValidIsolationPosition(positions[i], voxelData.length))
+                {
+                    fragments[i].Dispose();
+                    continue;
+                }
+
+                // ✅ FIX: Use saved matrix for consistent positioning
+                Vector3 worldPos = TransformPointUsingSavedIsolationMatrix(positions[i] * voxelSize);
                 
-                GameObject nObj = InstantiateVox(isoSettings.isolationFragmentPrefab, targetFilter.transform.TransformPoint(positions[i] * GetSingleVoxelSize()), targetFilter.transform.rotation);
+                GameObject nObj = InstantiateVox(
+                    isoSettings.isolationFragmentPrefab, 
+                    worldPos, 
+                    worldRot
+                );
                 DisableDataProviders(nObj);
                 nObj.transform.parent = fragmentParent;
                 
@@ -208,7 +242,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 if (vox != null)
                 {
                     vox.scaleType = ScaleType.Voxel;
-                    vox.objectScale = GetSingleVoxelSize();
+                    vox.objectScale = voxelSize;
                     if (vox is IsolatedVoxelObj iso)
                         iso.fragmentParent = fragmentParent;
                     
@@ -222,6 +256,57 @@ namespace VoxelDestructionPro.VoxelObjects
 
                 fragmentGroup?.SpawnAttachmentsForFragment(i, nObj.transform, attachmentMap);
             }
+
+            hasSavedIsolationMatrix = false;
+        }
+        
+        /// <summary>
+        /// ✅ FIX: Validates position to prevent coordinate errors from isolation processor
+        /// </summary>
+        private bool IsValidIsolationPosition(Vector3 position, Unity.Mathematics.int3 length)
+        {
+            // Check for NaN or Infinity
+            if (float.IsNaN(position.x) || float.IsNaN(position.y) || float.IsNaN(position.z) ||
+                float.IsInfinity(position.x) || float.IsInfinity(position.y) || float.IsInfinity(position.z))
+                return false;
+            
+            // Check if position is within reasonable bounds
+            if (position.x < -0.5f || position.x > length.x + 0.5f ||
+                position.y < -0.5f || position.y > length.y + 0.5f ||
+                position.z < -0.5f || position.z > length.z + 0.5f)
+                return false;
+            
+            return true;
+        }
+
+        /// <summary>
+        /// ✅ FIX: Трансформирует локальную позицию в мировую используя сохранённую матрицу изоляции
+        /// </summary>
+        private Vector3 TransformPointUsingSavedIsolationMatrix(Vector3 localPosition)
+        {
+            if (!hasSavedIsolationMatrix)
+            {
+                // Fallback на текущий transform если матрица не сохранена
+                Transform meshTransform = targetFilter != null ? targetFilter.transform : transform;
+                return meshTransform.TransformPoint(localPosition);
+            }
+
+            return savedIsolationTransformMatrix.MultiplyPoint3x4(localPosition);
+        }
+
+        /// <summary>
+        /// ✅ FIX: Извлекает rotation из сохранённой матрицы изоляции
+        /// </summary>
+        private Quaternion GetRotationFromSavedIsolationMatrix()
+        {
+            if (!hasSavedIsolationMatrix)
+            {
+                // Fallback на текущий transform если матрица не сохранена
+                Transform meshTransform = targetFilter != null ? targetFilter.transform : transform;
+                return meshTransform.rotation;
+            }
+
+            return savedIsolationTransformMatrix.rotation;
         }
 
         private static void DisableDataProviders(GameObject obj)
@@ -258,6 +343,8 @@ namespace VoxelDestructionPro.VoxelObjects
             if (isolator != null)
                 isolator.Dispose();
             isolator = null;
+
+            hasSavedIsolationMatrix = false;
             
             base.DisposeAll();
         }
@@ -267,6 +354,7 @@ namespace VoxelDestructionPro.VoxelObjects
             isolatorActive = false;
             isolationProcessorActive = false;
             isolatorRequested = false;
+            hasSavedIsolationMatrix = false;
             base.DestroyVoxObj();
         }
     }   
