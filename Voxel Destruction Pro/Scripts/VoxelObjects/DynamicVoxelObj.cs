@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using Unity.Collections;
@@ -24,6 +24,8 @@ namespace VoxelDestructionPro.VoxelObjects
     /// <summary>
     /// This voxel object contains the main destruction functions:
     /// AddDestruction, AddDestruction_Sphere, AddDestruction_Cube and AddDestruction_Line
+    /// 
+    /// ✅ FIX: Сохраняет матрицу трансформации в начале destruction для корректного позиционирования фрагментов
     /// </summary>
     public class DynamicVoxelObj : IsolatedVoxelObj
     {
@@ -72,6 +74,10 @@ namespace VoxelDestructionPro.VoxelObjects
         // =========================
         private CompoundBoxColliderManager compoundColliderManager;
         private int _lastCompoundBuildVersion = -1;
+
+        // ✅ FIX: Сохранённая матрица трансформации для корректного позиционирования фрагментов
+        private Matrix4x4 savedDestructionTransformMatrix;
+        private bool hasSavedDestructionMatrix;
 
         // Active states
         protected bool destructionActive;
@@ -489,9 +495,16 @@ namespace VoxelDestructionPro.VoxelObjects
 
         private IEnumerator _AddDestruction(DestructionData data, object fragmenterSettings)
         {
-            data.start = targetFilter.transform.InverseTransformPoint(data.start) / GetSingleVoxelSize();
+            // ✅ FIX: Сохраняем матрицу трансформации ДО любых изменений
+            Transform meshTransform = targetFilter != null ? targetFilter.transform : transform;
+            savedDestructionTransformMatrix = meshTransform.localToWorldMatrix;
+            hasSavedDestructionMatrix = true;
+            float voxelSize = GetSingleVoxelSize();
+
+            // Конвертируем мировые координаты в локальные воксельные
+            data.start = meshTransform.InverseTransformPoint(data.start) / voxelSize;
             if (data.destructionType == DestructionData.DestructionType.Line)
-                data.end = targetFilter.transform.InverseTransformPoint(data.end) / GetSingleVoxelSize();
+                data.end = meshTransform.InverseTransformPoint(data.end) / voxelSize;
 
             destructor.Prepare(data);
 
@@ -515,6 +528,7 @@ namespace VoxelDestructionPro.VoxelObjects
                     objectDestructionRequested = true;
                     destructionActive = false;
                     pendingAffectedMaterials = null;
+                    hasSavedDestructionMatrix = false;
                     yield break;
                 }
             }
@@ -532,6 +546,7 @@ namespace VoxelDestructionPro.VoxelObjects
                     objectDestructionRequested = true;
                     destructionActive = false;
                     pendingAffectedMaterials = null;
+                    hasSavedDestructionMatrix = false;
                     yield break;
                 }
             }
@@ -674,16 +689,36 @@ namespace VoxelDestructionPro.VoxelObjects
             VoxelData[] fragments = fragmenter.CreateFragments(voxelData, out Vector3[] positions);
             VoxelSlowDebugLogger.Log("AfterCreateFragments_Source", name, voxelData);
 
+            // ✅ OPTIMIZATION: Cache voxel size - called many times in loops
+            float voxelSize = GetSingleVoxelSize();
+            
+            // ✅ OPTIMIZATION: Cache rotation - extracted once instead of per fragment
+            Quaternion worldRot = GetRotationFromSavedMatrix();
+
+            // ✅ OPTIMIZATION: Early exit for small counts (no batching needed)
+            const int BATCH_THRESHOLD = 50;
+            bool useBatching = (positions != null && positions.Length > BATCH_THRESHOLD) || 
+                               (fragments != null && fragments.Length > BATCH_THRESHOLD);
+            const int BATCH_SIZE = 20; // Process 20 fragments per frame max
+
             if (fragments == null)
             {
                 if (positions != null && fragmenter.UseVoxelFragments())
                 {
                     int3 length = voxelData.length;
-                    HashSet<int> spawnedIndices = new HashSet<int>();
+                    HashSet<int> spawnedIndices = new HashSet<int>(positions.Length);
+                    
+                    // ✅ OPTIMIZATION: Pre-scale voxel size for vector operations
+                    Vector3 voxelSizeVec = voxelSize * Vector3.one;
 
                     for (int i = 0; i < positions.Length; i++)
                     {
                         Vector3 position = positions[i];
+                        
+                        // ✅ FIX: Validate position before spawning to prevent coordinate errors
+                        if (!IsValidPosition(position, length))
+                            continue;
+                        
                         int x = Mathf.RoundToInt(position.x);
                         int y = Mathf.RoundToInt(position.y);
                         int z = Mathf.RoundToInt(position.z);
@@ -692,16 +727,19 @@ namespace VoxelDestructionPro.VoxelObjects
                         if (!spawnedIndices.Add(index))
                             continue;
 
+                        // ✅ FIX: Use saved matrix for consistent positioning
+                        Vector3 worldPos = TransformPointUsingSavedMatrix(position * voxelSize);
+
                         GameObject nObj = InstantiateVox(
                             dynamicSettings.voxelPrefab,
-                            targetFilter.transform.TransformPoint(position * GetSingleVoxelSize()),
-                            targetFilter.transform.rotation
+                            worldPos,
+                            worldRot
                         );
 
                         DisableDataProviders(nObj);
 
                         nObj.transform.parent = fragmentParent;
-                        nObj.transform.localScale = GetSingleVoxelSize() * Vector3.one;
+                        nObj.transform.localScale = voxelSizeVec;
 
                         ApplyFragmentColliderMode(nObj);
                         ApplyVoxelFragmentColor(nObj, positions[i]);
@@ -711,11 +749,16 @@ namespace VoxelDestructionPro.VoxelObjects
                             dyn.voxelMaterialType = voxelMaterialType;
 
                         onFragmentSpawned?.Invoke(nObj);
+                        
+                        // ✅ OPTIMIZATION: Batch processing - yield every N fragments for large sets
+                        if (useBatching && (i + 1) % BATCH_SIZE == 0)
+                            yield return null;
                     }
                 }
 
                 fragmentProcessingActive = false;
                 pendingFragmentColors = null;
+                hasSavedDestructionMatrix = false;
                 yield break;
             }
 
@@ -732,7 +775,8 @@ namespace VoxelDestructionPro.VoxelObjects
                 fragmentWorldPositions = new Vector3[positions.Length];
                 for (int p = 0; p < positions.Length; p++)
                 {
-                    fragmentWorldPositions[p] = targetFilter.transform.TransformPoint(positions[p] * GetSingleVoxelSize());
+                    // ✅ FIX: Use saved matrix for consistent positioning
+                    fragmentWorldPositions[p] = TransformPointUsingSavedMatrix(positions[p] * voxelSize);
                 }
 
                 attachmentMap = fragmentGroup.BuildAttachmentMap(transform, fragmentWorldPositions);
@@ -740,10 +784,17 @@ namespace VoxelDestructionPro.VoxelObjects
 
             for (int i = 0; i < fragments.Length; i++)
             {
+                // ✅ FIX: Validate position to prevent coordinate errors
+                if (!IsValidPosition(positions[i], voxelData.length))
+                    continue;
+                
+                // ✅ FIX: Use saved matrix for consistent positioning
+                Vector3 worldPos = TransformPointUsingSavedMatrix(positions[i] * voxelSize);
+
                 GameObject nObj = InstantiateVox(
                     dynamicSettings.fragmentPrefab,
-                    targetFilter.transform.TransformPoint(positions[i] * GetSingleVoxelSize()),
-                    targetFilter.transform.rotation
+                    worldPos,
+                    worldRot
                 );
 
                 DisableDataProviders(nObj);
@@ -757,7 +808,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 if (vox != null)
                 {
                     vox.scaleType = ScaleType.Voxel;
-                    vox.objectScale = GetSingleVoxelSize();
+                    vox.objectScale = voxelSize;
 
                     if (vox is IsolatedVoxelObj iso)
                         iso.fragmentParent = fragmentParent;
@@ -779,11 +830,65 @@ namespace VoxelDestructionPro.VoxelObjects
                 fragmentGroup?.SpawnAttachmentsForFragment(i, nObj.transform, attachmentMap);
 
                 onFragmentSpawned?.Invoke(nObj);
+                
+                // ✅ OPTIMIZATION: Batch processing - yield every N fragments for large sets
+                if (useBatching && (i + 1) % BATCH_SIZE == 0)
+                    yield return null;
             }
 
             fragmentProcessingActive = false;
             pendingFragmentColors = null;
+            hasSavedDestructionMatrix = false;
             yield break;
+        }
+        
+        /// <summary>
+        /// ✅ FIX: Validates position to prevent coordinate errors from fragmenter
+        /// </summary>
+        private bool IsValidPosition(Vector3 position, int3 length)
+        {
+            // Check for NaN or Infinity
+            if (float.IsNaN(position.x) || float.IsNaN(position.y) || float.IsNaN(position.z) ||
+                float.IsInfinity(position.x) || float.IsInfinity(position.y) || float.IsInfinity(position.z))
+                return false;
+            
+            // Check if position is within reasonable bounds
+            if (position.x < -0.5f || position.x > length.x + 0.5f ||
+                position.y < -0.5f || position.y > length.y + 0.5f ||
+                position.z < -0.5f || position.z > length.z + 0.5f)
+                return false;
+            
+            return true;
+        }
+
+        /// <summary>
+        /// ✅ FIX: Трансформирует локальную позицию в мировую используя сохранённую матрицу
+        /// </summary>
+        private Vector3 TransformPointUsingSavedMatrix(Vector3 localPosition)
+        {
+            if (!hasSavedDestructionMatrix)
+            {
+                // Fallback на текущий transform если матрица не сохранена
+                Transform meshTransform = targetFilter != null ? targetFilter.transform : transform;
+                return meshTransform.TransformPoint(localPosition);
+            }
+
+            return savedDestructionTransformMatrix.MultiplyPoint3x4(localPosition);
+        }
+
+        /// <summary>
+        /// ✅ FIX: Извлекает rotation из сохранённой матрицы
+        /// </summary>
+        private Quaternion GetRotationFromSavedMatrix()
+        {
+            if (!hasSavedDestructionMatrix)
+            {
+                // Fallback на текущий transform если матрица не сохранена
+                Transform meshTransform = targetFilter != null ? targetFilter.transform : transform;
+                return meshTransform.rotation;
+            }
+
+            return savedDestructionTransformMatrix.rotation;
         }
 
         private Dictionary<int, Color> CacheFragmentColors(NativeList<int> voxelIndex)
@@ -1029,6 +1134,8 @@ namespace VoxelDestructionPro.VoxelObjects
             fragmenter?.Dispose();
             fragmenter = null;
 
+            hasSavedDestructionMatrix = false;
+
             base.DisposeAll();
         }
 
@@ -1037,6 +1144,7 @@ namespace VoxelDestructionPro.VoxelObjects
             destructionActive = false;
             fragmenterActive = false;
             pendingAffectedMaterials = null;
+            hasSavedDestructionMatrix = false;
             base.DestroyVoxObj();
         }
     }
