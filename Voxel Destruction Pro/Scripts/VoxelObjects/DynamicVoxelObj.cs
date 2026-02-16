@@ -691,13 +691,13 @@ namespace VoxelDestructionPro.VoxelObjects
 
             // ✅ OPTIMIZATION: Cache voxel size - called many times in loops
             float voxelSize = GetSingleVoxelSize();
-            
+
             // ✅ OPTIMIZATION: Cache rotation - extracted once instead of per fragment
             Quaternion worldRot = GetRotationFromSavedMatrix();
 
             // ✅ OPTIMIZATION: Early exit for small counts (no batching needed)
             const int BATCH_THRESHOLD = 50;
-            bool useBatching = (positions != null && positions.Length > BATCH_THRESHOLD) || 
+            bool useBatching = (positions != null && positions.Length > BATCH_THRESHOLD) ||
                                (fragments != null && fragments.Length > BATCH_THRESHOLD);
             const int BATCH_SIZE = 20; // Process 20 fragments per frame max
 
@@ -707,18 +707,18 @@ namespace VoxelDestructionPro.VoxelObjects
                 {
                     int3 length = voxelData.length;
                     HashSet<int> spawnedIndices = new HashSet<int>(positions.Length);
-                    
+
                     // ✅ OPTIMIZATION: Pre-scale voxel size for vector operations
                     Vector3 voxelSizeVec = voxelSize * Vector3.one;
 
                     for (int i = 0; i < positions.Length; i++)
                     {
                         Vector3 position = positions[i];
-                        
+
                         // ✅ FIX: Validate position before spawning to prevent coordinate errors
                         if (!IsValidPosition(position, length))
                             continue;
-                        
+
                         int x = Mathf.RoundToInt(position.x);
                         int y = Mathf.RoundToInt(position.y);
                         int z = Mathf.RoundToInt(position.z);
@@ -749,7 +749,7 @@ namespace VoxelDestructionPro.VoxelObjects
                             dyn.voxelMaterialType = voxelMaterialType;
 
                         onFragmentSpawned?.Invoke(nObj);
-                        
+
                         // ✅ OPTIMIZATION: Batch processing - yield every N fragments for large sets
                         if (useBatching && (i + 1) % BATCH_SIZE == 0)
                             yield return null;
@@ -787,7 +787,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 // ✅ FIX: Validate position to prevent coordinate errors
                 if (!IsValidPosition(positions[i], voxelData.length))
                     continue;
-                
+
                 // ✅ FIX: Use saved matrix for consistent positioning
                 Vector3 worldPos = TransformPointUsingSavedMatrix(positions[i] * voxelSize);
 
@@ -830,7 +830,7 @@ namespace VoxelDestructionPro.VoxelObjects
                 fragmentGroup?.SpawnAttachmentsForFragment(i, nObj.transform, attachmentMap);
 
                 onFragmentSpawned?.Invoke(nObj);
-                
+
                 // ✅ OPTIMIZATION: Batch processing - yield every N fragments for large sets
                 if (useBatching && (i + 1) % BATCH_SIZE == 0)
                     yield return null;
@@ -841,7 +841,7 @@ namespace VoxelDestructionPro.VoxelObjects
             hasSavedDestructionMatrix = false;
             yield break;
         }
-        
+
         /// <summary>
         /// ✅ FIX: Validates position to prevent coordinate errors from fragmenter
         /// </summary>
@@ -851,13 +851,13 @@ namespace VoxelDestructionPro.VoxelObjects
             if (float.IsNaN(position.x) || float.IsNaN(position.y) || float.IsNaN(position.z) ||
                 float.IsInfinity(position.x) || float.IsInfinity(position.y) || float.IsInfinity(position.z))
                 return false;
-            
+
             // Check if position is within reasonable bounds
             if (position.x < -0.5f || position.x > length.x + 0.5f ||
                 position.y < -0.5f || position.y > length.y + 0.5f ||
                 position.z < -0.5f || position.z > length.z + 0.5f)
                 return false;
-            
+
             return true;
         }
 
